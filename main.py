@@ -137,6 +137,26 @@ def main(page: ft.Page):
     page.scroll = ft.ScrollMode.ADAPTIVE
 
     bot_instance = None
+    
+    try:
+        from flet_permission_handler import PermissionHandler, PermissionType
+        import flet_android_notifications as fan
+        
+        ph = PermissionHandler()
+        page.overlay.append(ph)
+        
+        notifications = fan.FletAndroidNotifications()
+        page.overlay.append(notifications)
+        
+        def on_page_load(e):
+            ph.request_permissions([PermissionType.NOTIFICATION])
+            notifications.init()
+            notifications.create_notification_channel("owo_alerts", "OWO Alerts", "Alerts for Captcha")
+            
+        page.on_connect = on_page_load
+    except ImportError:
+        notifications = None
+        ph = None
 
     def log(msg, color="white"):
         logs_view.controls.append(ft.Text(msg, color=color))
@@ -152,6 +172,17 @@ def main(page: ft.Page):
         page.update()
 
     def show_notification(title, text):
+        if notifications:
+            try:
+                notifications.show_notification(
+                    id=1,
+                    title=title,
+                    body=text,
+                    channel_id="owo_alerts"
+                )
+            except:
+                pass
+                
         page.snack_bar = ft.SnackBar(
             content=ft.Text(f"{title}: {text}", color="white", weight="bold"),
             bgcolor="red"

@@ -1,0 +1,15 @@
+[project]
+name = "owo_bot_apk"
+version = "1.0.0"
+dependencies = [
+    "flet==0.23.2",
+    "flet-android-notifications==0.10.0",
+    "flet-permission-handler==0.86.5",
+    "requests",
+    "websocket-client"
+]
+
+[tool.flet.android.permission]
+"android.permission.POST_NOTIFICATIONS" = true
+"android.permission.SCHEDULE_EXACT_ALARM" = true
+"android.permission.RECEIVE_BOOT_COMPLETED" = true
