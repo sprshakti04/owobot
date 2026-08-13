@@ -1,12 +1,10 @@
 import flet as ft
-import websocket
-import json
 import threading
 import requests
 import time
 
 class MinimalDiscordBot:
-    def __init__(self, token, channel_id, base_bet, cooldown, max_bet, log_cb, stat_cb):
+    def __init__(self, token, channel_id, base_bet, cooldown, max_bet, log_cb, stat_cb, dm_cb):
         self.token = token
         self.channel_id = str(channel_id)
         self.base_bet = int(base_bet)
@@ -16,17 +14,14 @@ class MinimalDiscordBot:
         
         self.log = log_cb
         self.update_stats = stat_cb
+        self.show_notification = dm_cb
         
         self.running = False
         self.total_wins = 0
         self.total_losses = 0
         self.profit = 0
         
-        self.ws = None
         self.owo_id = "408785106942164992"
-        self._waiting_result = False
-        self._result_event = threading.Event()
-        self._last_result = None
 
     def send_message(self, content):
         url = f"https://discord.com/api/v9/channels/{self.channel_id}/messages"
@@ -38,65 +33,37 @@ class MinimalDiscordBot:
         except Exception as e:
             return False
 
-    def on_message(self, ws, message):
+    def fetch_messages(self):
+        url = f"https://discord.com/api/v9/channels/{self.channel_id}/messages?limit=5"
+        headers = {"Authorization": self.token}
         try:
-            data = json.loads(message)
-            op = data.get("op")
-            t = data.get("t")
-            d = data.get("d")
-            
-            if op == 10: # Hello
-                heartbeat_interval = d["heartbeat_interval"] / 1000
-                threading.Thread(target=self.heartbeat, args=(heartbeat_interval,), daemon=True).start()
-                
-                payload = {
-                    "op": 2,
-                    "d": {
-                        "token": self.token,
-                        "capabilities": 16381,
-                        "properties": {
-                            "os": "Windows",
-                            "browser": "Chrome",
-                            "device": "",
-                        }
-                    }
-                }
-                ws.send(json.dumps(payload))
-                
-            elif t in ["MESSAGE_CREATE", "MESSAGE_UPDATE"] and d:
-                if str(d.get("channel_id")) == self.channel_id and str(d.get("author", {}).get("id")) == self.owo_id:
-                    content = (d.get("content") or "").lower()
-                    embeds = d.get("embeds", [])
-                    for emb in embeds:
-                        content += " " + (emb.get("description") or "").lower()
-                        content += " " + (emb.get("title") or "").lower()
-                    
-                    if "captcha" in content or "verify" in content or "human" in content or "type the code" in content:
-                        self.log("🚨 CAPTCHA DETECTED! Pausing.", "red")
-                        self.running = False
-                        return
-                    
-                    if self._waiting_result:
-                        if "and you won" in content:
-                            self._last_result = "win"
-                            self._result_event.set()
-                        elif "and you lost" in content:
-                            self._last_result = "loss"
-                            self._result_event.set()
-        except Exception as e:
+            r = requests.get(url, headers=headers)
+            if r.status_code == 200:
+                return r.json()
+        except:
             pass
+        return []
 
-    def heartbeat(self, interval):
-        while self.running and self.ws:
-            time.sleep(interval)
-            try:
-                self.ws.send(json.dumps({"op": 1, "d": None}))
-            except:
-                break
+    def check_message_content(self, msg_data):
+        if str(msg_data.get("author", {}).get("id")) != self.owo_id:
+            return None
+            
+        content = (msg_data.get("content") or "").lower()
+        embeds = msg_data.get("embeds", [])
+        for emb in embeds:
+            content += " " + (emb.get("description") or "").lower()
+            content += " " + (emb.get("title") or "").lower()
+            
+        if "captcha" in content or "verify" in content or "human" in content or "type the code" in content:
+            return "captcha"
+        if "and you won" in content:
+            return "win"
+        if "and you lost" in content:
+            return "loss"
+        return None
 
     def bot_loop(self):
-        # Small delay to let WS connect
-        time.sleep(2)
+        self.log("✅ Bot running via HTTP Polling!", "green")
         while self.running:
             if self.current_bet > self.max_bet:
                 self.log(f"⚠️ Max bet hit ({self.current_bet}). Resetting.", "orange")
@@ -105,48 +72,62 @@ class MinimalDiscordBot:
             cmd = f"owo cf {self.current_bet}"
             self.log(f"🎲 Sending: {cmd}", "blue")
             
-            self._last_result = None
-            self._result_event.clear()
-            self._waiting_result = True
-            
             success = self.send_message(cmd)
             if not success:
                 self.log("❌ Failed to send message.", "red")
-            else:
-                hit = self._result_event.wait(timeout=15.0)
-                if not hit:
-                    self.log("⚠️ No response from OWO. Retrying.", "orange")
-                else:
-                    if self._last_result == "win":
+                time.sleep(self.cooldown)
+                continue
+            
+            # Poll for 15 seconds to wait for result
+            result_found = False
+            start_wait = time.time()
+            
+            while time.time() - start_wait < 15.0 and self.running:
+                time.sleep(2) # check every 2 seconds
+                msgs = self.fetch_messages()
+                
+                for m in msgs:
+                    # check if message is newer than our send time
+                    res = self.check_message_content(m)
+                    
+                    if res == "captcha":
+                        self.log("🚨 CAPTCHA DETECTED! Pausing.", "red")
+                        self.show_notification("CAPTCHA DETECTED", "Open Discord to solve it!")
+                        self.running = False
+                        return
+                    elif res == "win":
                         self.total_wins += 1
                         self.profit += self.current_bet
                         self.log(f"🏆 Won {self.current_bet}! Reset to {self.base_bet}.", "green")
                         self.current_bet = self.base_bet
-                    elif self._last_result == "loss":
+                        result_found = True
+                        break
+                    elif res == "loss":
                         self.total_losses += 1
                         self.profit -= self.current_bet
                         new_bet = self.current_bet * 2
                         self.log(f"💀 Lost {self.current_bet}. Doubling to {new_bet}.", "red")
                         self.current_bet = new_bet
+                        result_found = True
+                        break
                         
-                    self.update_stats(self.total_wins, self.total_losses, self.profit)
+                if result_found:
+                    break
+                    
+            if not result_found and self.running:
+                self.log("⚠️ No response from OWO. Retrying.", "orange")
+            elif result_found:
+                self.update_stats(self.total_wins, self.total_losses, self.profit)
             
             if self.running:
                 time.sleep(self.cooldown)
 
     def start(self):
         self.running = True
-        self.ws = websocket.WebSocketApp("wss://gateway.discord.gg/?v=9&encoding=json",
-                                         on_message=self.on_message)
-        
-        threading.Thread(target=self.ws.run_forever, daemon=True).start()
         threading.Thread(target=self.bot_loop, daemon=True).start()
-        self.log("✅ Bot connected and running!", "green")
 
     def stop(self):
         self.running = False
-        if self.ws:
-            self.ws.close()
 
 
 def main(page: ft.Page):
@@ -170,6 +151,14 @@ def main(page: ft.Page):
         prof_txt.color = "green" if profit >= 0 else "red"
         page.update()
 
+    def show_notification(title, text):
+        page.snack_bar = ft.SnackBar(
+            content=ft.Text(f"{title}: {text}", color="white", weight="bold"),
+            bgcolor="red"
+        )
+        page.snack_bar.open = True
+        page.update()
+
     def start_bot(e):
         nonlocal bot_instance
         if not token_input.value or not channel_input.value:
@@ -188,7 +177,8 @@ def main(page: ft.Page):
                 cd_input.value,
                 max_input.value,
                 log,
-                update_stats
+                update_stats,
+                show_notification
             )
             log("🔄 Connecting to Discord...", "yellow")
             bot_instance.start()
