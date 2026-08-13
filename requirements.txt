@@ -1,0 +1,2 @@
+flet==0.23.2
+discord.py-self==2.1.0
