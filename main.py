@@ -1,133 +1,152 @@
 import flet as ft
-import asyncio
-import discord
-from discord.ext import tasks
-import sys
+import websocket
+import json
+import threading
+import requests
+import time
 
-class OWOBot(discord.Client):
-    def __init__(self, token, channel_id, base_bet, cooldown, max_bet, log_callback, stat_callback):
-        super().__init__()
-        self.token_str = token
-        self.channel_id = int(channel_id)
+class MinimalDiscordBot:
+    def __init__(self, token, channel_id, base_bet, cooldown, max_bet, log_cb, stat_cb):
+        self.token = token
+        self.channel_id = str(channel_id)
         self.base_bet = int(base_bet)
         self.current_bet = self.base_bet
         self.cooldown = int(cooldown)
         self.max_bet = int(max_bet)
         
-        self.log = log_callback
-        self.update_stats = stat_callback
+        self.log = log_cb
+        self.update_stats = stat_cb
         
-        self.running_loop = False
+        self.running = False
         self.total_wins = 0
         self.total_losses = 0
         self.profit = 0
         
-        self.owo_id = 408785106942164992
+        self.ws = None
+        self.owo_id = "408785106942164992"
         self._waiting_result = False
-        self._result_event = asyncio.Event()
+        self._result_event = threading.Event()
         self._last_result = None
-        self.channel = None
 
-    async def on_ready(self):
-        self.log(f"✅ Logged in as {self.user}", "green")
+    def send_message(self, content):
+        url = f"https://discord.com/api/v9/channels/{self.channel_id}/messages"
+        headers = {"Authorization": self.token, "Content-Type": "application/json"}
+        payload = {"content": content}
         try:
-            self.channel = await self.fetch_channel(self.channel_id)
-            self.log(f"✅ Channel Found: #{self.channel.name}", "green")
-            self.running_loop = True
-            self.bot_loop.start()
+            r = requests.post(url, headers=headers, json=payload)
+            return r.status_code == 200
         except Exception as e:
-            self.log(f"❌ Could not find channel: {e}", "red")
+            return False
 
-    async def on_message(self, message):
-        await self._check_captcha(message)
-        await self._check_result(message)
-
-    async def on_message_edit(self, before, after):
-        await self._check_captcha(after)
-        await self._check_result(after)
-
-    async def _check_captcha(self, message):
-        if message.channel.id != self.channel_id or message.author.id != self.owo_id:
-            return
-        
-        text = message.content.lower()
-        if message.embeds:
-            for emb in message.embeds:
-                if emb.description: text += emb.description.lower()
-                if emb.title: text += emb.title.lower()
-
-        captcha_kws = ["captcha", "verify", "human verification", "type the code"]
-        if any(kw in text for kw in captcha_kws):
-            self.log("🚨 CAPTCHA DETECTED! Bot paused.", "red")
-            self.running_loop = False
-            if self.bot_loop.is_running():
-                self.bot_loop.cancel()
-
-    async def _check_result(self, message):
-        if not self._waiting_result or message.channel.id != self.channel_id or message.author.id != self.owo_id:
-            return
-
-        text = message.content.lower()
-        if message.embeds:
-            for emb in message.embeds:
-                if emb.description: text += emb.description.lower()
-                if emb.title: text += emb.title.lower()
-
-        if "and you won" in text:
-            self._last_result = "win"
-            self._result_event.set()
-        elif "and you lost" in text:
-            self._last_result = "loss"
-            self._result_event.set()
-
-    @tasks.loop(seconds=1)
-    async def bot_loop(self):
-        if not self.running_loop:
-            return
-
-        # Cap check
-        if self.current_bet > self.max_bet:
-            self.log(f"⚠️ Max bet hit ({self.current_bet}). Resetting.", "orange")
-            self.current_bet = self.base_bet
-
-        cmd = f"owo cf {self.current_bet}"
-        self.log(f"🎲 Sending: {cmd}", "blue")
-        
-        self._last_result = None
-        self._result_event.clear()
-        self._waiting_result = True
-
+    def on_message(self, ws, message):
         try:
-            await self.channel.send(cmd)
+            data = json.loads(message)
+            op = data.get("op")
+            t = data.get("t")
+            d = data.get("d")
+            
+            if op == 10: # Hello
+                heartbeat_interval = d["heartbeat_interval"] / 1000
+                threading.Thread(target=self.heartbeat, args=(heartbeat_interval,), daemon=True).start()
+                
+                payload = {
+                    "op": 2,
+                    "d": {
+                        "token": self.token,
+                        "capabilities": 16381,
+                        "properties": {
+                            "os": "Windows",
+                            "browser": "Chrome",
+                            "device": "",
+                        }
+                    }
+                }
+                ws.send(json.dumps(payload))
+                
+            elif t in ["MESSAGE_CREATE", "MESSAGE_UPDATE"] and d:
+                if str(d.get("channel_id")) == self.channel_id and str(d.get("author", {}).get("id")) == self.owo_id:
+                    content = (d.get("content") or "").lower()
+                    embeds = d.get("embeds", [])
+                    for emb in embeds:
+                        content += " " + (emb.get("description") or "").lower()
+                        content += " " + (emb.get("title") or "").lower()
+                    
+                    if "captcha" in content or "verify" in content or "human" in content or "type the code" in content:
+                        self.log("🚨 CAPTCHA DETECTED! Pausing.", "red")
+                        self.running = False
+                        return
+                    
+                    if self._waiting_result:
+                        if "and you won" in content:
+                            self._last_result = "win"
+                            self._result_event.set()
+                        elif "and you lost" in content:
+                            self._last_result = "loss"
+                            self._result_event.set()
         except Exception as e:
-            self.log(f"❌ Failed to send: {e}", "red")
-            self.bot_loop.change_interval(seconds=self.cooldown)
-            return
+            pass
 
-        try:
-            await asyncio.wait_for(self._result_event.wait(), timeout=15.0)
-        except asyncio.TimeoutError:
-            self.log("⚠️ No response from OWO. Retrying next round.", "orange")
-            self._waiting_result = False
-            self.bot_loop.change_interval(seconds=self.cooldown)
-            return
+    def heartbeat(self, interval):
+        while self.running and self.ws:
+            time.sleep(interval)
+            try:
+                self.ws.send(json.dumps({"op": 1, "d": None}))
+            except:
+                break
 
-        self._waiting_result = False
+    def bot_loop(self):
+        # Small delay to let WS connect
+        time.sleep(2)
+        while self.running:
+            if self.current_bet > self.max_bet:
+                self.log(f"⚠️ Max bet hit ({self.current_bet}). Resetting.", "orange")
+                self.current_bet = self.base_bet
+                
+            cmd = f"owo cf {self.current_bet}"
+            self.log(f"🎲 Sending: {cmd}", "blue")
+            
+            self._last_result = None
+            self._result_event.clear()
+            self._waiting_result = True
+            
+            success = self.send_message(cmd)
+            if not success:
+                self.log("❌ Failed to send message.", "red")
+            else:
+                hit = self._result_event.wait(timeout=15.0)
+                if not hit:
+                    self.log("⚠️ No response from OWO. Retrying.", "orange")
+                else:
+                    if self._last_result == "win":
+                        self.total_wins += 1
+                        self.profit += self.current_bet
+                        self.log(f"🏆 Won {self.current_bet}! Reset to {self.base_bet}.", "green")
+                        self.current_bet = self.base_bet
+                    elif self._last_result == "loss":
+                        self.total_losses += 1
+                        self.profit -= self.current_bet
+                        new_bet = self.current_bet * 2
+                        self.log(f"💀 Lost {self.current_bet}. Doubling to {new_bet}.", "red")
+                        self.current_bet = new_bet
+                        
+                    self.update_stats(self.total_wins, self.total_losses, self.profit)
+            
+            if self.running:
+                time.sleep(self.cooldown)
 
-        if self._last_result == "win":
-            self.total_wins += 1
-            self.profit += self.current_bet
-            self.log(f"🏆 Won {self.current_bet}! Resetting to {self.base_bet}.", "green")
-            self.current_bet = self.base_bet
-        elif self._last_result == "loss":
-            self.total_losses += 1
-            self.profit -= self.current_bet
-            new_bet = self.current_bet * 2
-            self.log(f"💀 Lost {self.current_bet}. Doubling to {new_bet}.", "red")
-            self.current_bet = new_bet
+    def start(self):
+        self.running = True
+        self.ws = websocket.WebSocketApp("wss://gateway.discord.gg/?v=9&encoding=json",
+                                         on_message=self.on_message)
         
-        self.update_stats(self.total_wins, self.total_losses, self.profit)
-        self.bot_loop.change_interval(seconds=self.cooldown)
+        threading.Thread(target=self.ws.run_forever, daemon=True).start()
+        threading.Thread(target=self.bot_loop, daemon=True).start()
+        self.log("✅ Bot connected and running!", "green")
+
+    def stop(self):
+        self.running = False
+        if self.ws:
+            self.ws.close()
 
 
 def main(page: ft.Page):
@@ -137,7 +156,6 @@ def main(page: ft.Page):
     page.scroll = ft.ScrollMode.ADAPTIVE
 
     bot_instance = None
-    bot_task = None
 
     def log(msg, color="white"):
         logs_view.controls.append(ft.Text(msg, color=color))
@@ -152,8 +170,8 @@ def main(page: ft.Page):
         prof_txt.color = "green" if profit >= 0 else "red"
         page.update()
 
-    async def start_bot(e):
-        nonlocal bot_instance, bot_task
+    def start_bot(e):
+        nonlocal bot_instance
         if not token_input.value or not channel_input.value:
             log("❌ Token and Channel ID are required!", "red")
             return
@@ -163,7 +181,7 @@ def main(page: ft.Page):
             btn_start.bgcolor = ft.colors.RED_700
             page.update()
             
-            bot_instance = OWOBot(
+            bot_instance = MinimalDiscordBot(
                 token_input.value,
                 channel_input.value,
                 base_input.value,
@@ -173,13 +191,10 @@ def main(page: ft.Page):
                 update_stats
             )
             log("🔄 Connecting to Discord...", "yellow")
-            bot_task = asyncio.create_task(bot_instance.start(token_input.value))
+            bot_instance.start()
         else:
             if bot_instance:
-                bot_instance.running_loop = False
-                await bot_instance.close()
-            if bot_task:
-                bot_task.cancel()
+                bot_instance.stop()
             
             btn_start.text = "Start Bot"
             btn_start.bgcolor = ft.colors.BLUE_700
@@ -227,7 +242,7 @@ def main(page: ft.Page):
             channel_input,
             ft.Divider(),
             ft.Text("Bet Settings", weight="bold"),
-            ft.Row([base_input, max_input, cd_input]),
+            ft.Row([base_input, max_input, cd_input], alignment=ft.MainAxisAlignment.CENTER),
             ft.Container(height=10),
             ft.Row([btn_start], alignment=ft.MainAxisAlignment.CENTER),
             ft.Divider(),
